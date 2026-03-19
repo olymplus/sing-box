@@ -1,0 +1,100 @@
+name: Sync Upstream Release
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check upstream latest release
+        id: upstream
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const upstreamOwner = 'SagerNet';
+            const upstreamRepo = 'sing-box';
+
+            const release = await github.rest.repos.getLatestRelease({
+              owner: upstreamOwner,
+              repo: upstreamRepo,
+            });
+
+            core.setOutput('tag_name', release.data.tag_name);
+            core.setOutput('release_name', release.data.name || release.data.tag_name);
+            core.setOutput('body', release.data.body || '');
+            core.setOutput('html_url', release.data.html_url);
+
+      - name: Check if release already exists in fork
+        id: exists
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = `${{ steps.upstream.outputs.tag_name }}`;
+
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              });
+              core.setOutput('exists', 'true');
+            } catch (error) {
+              if (error.status === 404) {
+                core.setOutput('exists', 'false');
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Create tag if missing
+        if: steps.exists.outputs.exists == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = `${{ steps.upstream.outputs.tag_name }}`;
+            const defaultBranch = context.payload.repository.default_branch;
+
+            const branch = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: defaultBranch,
+            });
+
+            const sha = branch.data.commit.sha;
+
+            try {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/tags/${tag}`,
+                sha,
+              });
+            } catch (error) {
+              if (error.status !== 422) {
+                throw error;
+              }
+            }
+
+      - name: Create release in fork
+        if: steps.exists.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.upstream.outputs.tag_name }}
+          name: ${{ steps.upstream.outputs.release_name }}
+          body: |
+            This release is synced automatically from upstream.
+
+            Upstream release: ${{ steps.upstream.outputs.html_url }}
+
+            ---
+
+            ${{ steps.upstream.outputs.body }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
