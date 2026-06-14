@@ -1,0 +1,111 @@
+name: Build Alpine x86 (amd64)
+
+# 只编译适合 Alpine x86_64 运行的 sing-box 二进制。
+# sing-box 用 CGO_ENABLED=0 编译，产出纯静态二进制，不链接任何 libc，
+# 因此在 Alpine(musl) 上原生即可运行，无需 musl 工具链或 Alpine 容器。
+# 不构建 windows / arm / darwin / android 等任何其它目标。
+#
+# 触发方式：
+#   - 手动 workflow_dispatch：产物作为 Actions artifact 下载。
+#   - push 形如 v1.2.3 的 tag：自动编译并发布到对应 GitHub Release。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本名（留空则用 read_tag 自动计算）"
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write          # 发 Release 需要写权限
+
+jobs:
+  build:
+    name: Build linux/amd64 (static, Alpine-ready)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0          # read_tag 需要完整历史/标签来算版本号
+          submodules: recursive   # 上游含子模块
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.7"    # 对齐 go.mod
+          check-latest: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # 推 tag 触发：直接用 tag 名去掉前导 v 作为版本
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            # read_tag 出错时会输出字面量 "unknown"，需一并回退
+            VERSION="$(CGO_ENABLED=0 go run ./cmd/internal/read_tag 2>/dev/null | head -n1 || true)"
+            if [ -z "$VERSION" ] || [ "$VERSION" = "unknown" ]; then
+              VERSION="dev-$(git rev-parse --short HEAD)"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "name=sing-box-$VERSION-linux-amd64" >> "$GITHUB_OUTPUT"
+          echo "解析到版本: $VERSION"
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"        # 关键：纯静态，musl/glibc 通吃
+          GOOS: linux
+          GOARCH: amd64
+          GOAMD64: v1             # 兼容最老的 x86_64，避免老 CPU 上 SIGILL
+        run: |
+          set -euo pipefail
+          # build tags / ldflags 复用 Makefile（它从 release/ 文件读取，随上游同步）。
+          # 版本号通过 VERSION= 覆盖，保证构建口径与官方一致。
+          export GOTOOLCHAIN=local
+          make build VERSION="${{ steps.version.outputs.version }}"
+          ./sing-box version
+
+      - name: Package tar.gz
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.version.outputs.name }}"
+          mkdir -p "dist/$NAME"
+          cp sing-box "dist/$NAME/"
+          cp LICENSE "dist/$NAME/" 2>/dev/null || true
+          tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
+          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          ls -lh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }} (Alpine x86_64)
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
