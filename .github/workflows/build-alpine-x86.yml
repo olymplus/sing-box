@@ -44,11 +44,10 @@ jobs:
           if [ -n "${{ inputs.version }}" ]; then
             VERSION="${{ inputs.version }}"
           else
-            # 与上游一致：用内部工具从 git tag 计算版本号
-            # read_tag 出错时会输出字面量 "unknown"，需一并回退
-            VERSION="$(CGO_ENABLED=0 go run ./cmd/internal/read_tag 2>/dev/null | head -n1 || true)"
+            # 优先使用同步到的 reF1nd tag；fork 上额外叠加 workflow commit 时 read_tag 会退成 dev-*。
+            VERSION="$(git describe --tags --match 'v*-reF1nd' --abbrev=0 2>/dev/null | sed 's/^v//' || true)"
             if [ -z "$VERSION" ] || [ "$VERSION" = "unknown" ]; then
-              VERSION="$(git describe --tags --match 'v*-reF1nd' --abbrev=0 2>/dev/null | sed 's/^v//' || true)"
+              VERSION="$(CGO_ENABLED=0 go run ./cmd/internal/read_tag 2>/dev/null | head -n1 || true)"
             fi
             if [ -z "$VERSION" ] || [ "$VERSION" = "unknown" ]; then
               VERSION="dev-$(git rev-parse --short HEAD)"
