@@ -48,7 +48,7 @@ jobs:
             # read_tag 出错时会输出字面量 "unknown"，需一并回退
             VERSION="$(CGO_ENABLED=0 go run ./cmd/internal/read_tag 2>/dev/null | head -n1 || true)"
             if [ -z "$VERSION" ] || [ "$VERSION" = "unknown" ]; then
-              VERSION="$(git describe --tags --exact-match HEAD^ 2>/dev/null | sed 's/^v//' || true)"
+              VERSION="$(git describe --tags --match 'v*-reF1nd' --abbrev=0 2>/dev/null | sed 's/^v//' || true)"
             fi
             if [ -z "$VERSION" ] || [ "$VERSION" = "unknown" ]; then
               VERSION="dev-$(git rev-parse --short HEAD)"
