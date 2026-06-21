@@ -1,0 +1,120 @@
+name: Build Alpine x86 (amd64)
+
+# 编译适合 Alpine x86_64 运行的 sing-box 二进制，并额外产出 Win11 可用的 windows/amd64 exe。
+# Alpine 目标用 CGO_ENABLED=0 编译，产出纯静态二进制，不链接任何 libc，
+# 因此在 Alpine(musl) 上原生即可运行，无需 musl 工具链或 Alpine 容器。
+# 不构建 arm / darwin / android 等其它目标。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本名（留空则用 read_tag 自动计算）"
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build linux/amd64 and windows/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0          # read_tag 需要完整历史/标签来算版本号
+          submodules: recursive   # 上游含子模块
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.7"    # 对齐 go.mod
+          check-latest: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            # 与上游一致：用内部工具从 git tag 计算版本号
+            # read_tag 出错时会输出字面量 "unknown"，需一并回退
+            VERSION="$(CGO_ENABLED=0 go run ./cmd/internal/read_tag 2>/dev/null | head -n1 || true)"
+            if [ -z "$VERSION" ] || [ "$VERSION" = "unknown" ]; then
+              VERSION="dev-$(git rev-parse --short HEAD)"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "linux_name=sing-box-$VERSION-linux-amd64" >> "$GITHUB_OUTPUT"
+          echo "windows_name=sing-box-$VERSION-windows-amd64" >> "$GITHUB_OUTPUT"
+          echo "解析到版本: $VERSION"
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"        # 关键：纯静态，musl/glibc 通吃
+          GOOS: linux
+          GOARCH: amd64
+          GOAMD64: v1             # 兼容最老的 x86_64，避免老 CPU 上 SIGILL
+        run: |
+          set -euo pipefail
+          # build tags / ldflags 直接复用 Makefile，保证与 reF1nd 当前构建口径一致。
+          # 版本号通过 VERSION= 覆盖，避免 read_tag 在 fork 分支名上产生偏差。
+          export GOTOOLCHAIN=local
+          make build VERSION="${{ steps.version.outputs.version }}"
+          ./sing-box version
+
+      - name: Package tar.gz
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.version.outputs.linux_name }}"
+          mkdir -p "dist/$NAME"
+          cp sing-box "dist/$NAME/"
+          cp LICENSE "dist/$NAME/" 2>/dev/null || true
+          tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
+          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          ls -lh dist
+
+      - name: Build Windows exe
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          export GOTOOLCHAIN=local
+          NAME="${{ steps.version.outputs.windows_name }}"
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
+          LDFLAGS_SHARED="$(cat release/LDFLAGS)"
+          go build -v -trimpath -o "dist/${NAME}.exe" \
+            -tags "$TAGS" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ steps.version.outputs.version }}' $LDFLAGS_SHARED -s -w -buildid=" \
+            ./cmd/sing-box
+          ( cd dist && sha256sum "${NAME}.exe" > "${NAME}.exe.sha256" )
+          ls -lh dist
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.linux_name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.windows_name }}
+          path: |
+            dist/*.exe
+            dist/*.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
